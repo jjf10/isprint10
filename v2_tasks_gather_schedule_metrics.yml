@@ -1,0 +1,78 @@
+---
+# =============================================================================
+# gather_schedule_metrics.yml — new in v2
+# Query /api/v2/schedules/ for upcoming and recently-missed scheduled runs.
+# =============================================================================
+
+- name: "API: schedules — upcoming enabled runs (ordered by next_run)"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/schedules/?enabled=true&order_by=next_run&page_size={{ api_page_size_schedules }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_schedules_upcoming
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_schedules_upcoming is not failed
+
+- name: "API: schedules — count only (all, enabled=false)"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/schedules/?enabled=false&page_size=1"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_schedules_disabled
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_schedules_disabled is not failed
+
+- name: "API: schedules — total count (all)"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/schedules/?page_size=1"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_schedules_all
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_schedules_all is not failed
+
+# ── Consolidate ────────────────────────────────────────────────────────────────
+- name: Set schedule metric facts
+  ansible.builtin.set_fact:
+    metric_schedules_upcoming:      "{{ _r_schedules_upcoming.json.results | default([]) }}"
+    api_count_schedules_total:      "{{ _r_schedules_all.json.count      | default(0) | int }}"
+    api_count_schedules_enabled:    "{{ _r_schedules_upcoming.json.count | default(0) | int }}"
+    api_count_schedules_disabled:   "{{ _r_schedules_disabled.json.count | default(0) | int }}"
+
+# ── Schedules whose next_run is overdue (next_run < now) ──────────────────────
+# These are enabled schedules that haven't fired when they should have —
+# a sign that the controller scheduler may be backlogged or a job is stuck.
+- name: Flag overdue schedules from the upcoming list
+  ansible.builtin.set_fact:
+    metric_schedules_overdue: >-
+      {{
+        metric_schedules_upcoming
+        | selectattr('next_run', 'defined')
+        | selectattr('next_run', 'ne', none)
+        | selectattr('next_run', 'lt', report_ts)
+        | list
+      }}
+
+- name: Display schedule summary
+  ansible.builtin.debug:
+    msg:
+      - "──── Schedule Metrics ────"
+      - "Total schedules   : {{ api_count_schedules_total }}"
+      - "Enabled schedules : {{ api_count_schedules_enabled }}"
+      - "Disabled schedules: {{ api_count_schedules_disabled }}"
+      - "Overdue schedules : {{ metric_schedules_overdue | length }}"

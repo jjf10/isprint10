@@ -1,0 +1,65 @@
+---
+# Implements: Section 7.5 of AAP-API-Marketplace-Access.md
+# Poll /api/v2/jobs/{id}/ until terminal state, then fetch stdout
+
+- name: Poll job {{ aap_job_id }} until complete
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/jobs/{{ aap_job_id }}/"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+  register: aap_poll_result
+  until: aap_poll_result.json.status in ['successful', 'failed', 'error', 'canceled']
+  retries: "{{ aap_poll_retries }}"
+  delay: "{{ aap_poll_delay }}"
+  failed_when: aap_poll_result.status not in [200]
+  no_log: true
+
+- name: Set job result facts
+  ansible.builtin.set_fact:
+    aap_job_status: "{{ aap_poll_result.json.status }}"
+    aap_job_started: "{{ aap_poll_result.json.started }}"
+    aap_job_finished: "{{ aap_poll_result.json.finished }}"
+    aap_job_elapsed: "{{ aap_poll_result.json.elapsed }}"
+    aap_job_template_name: "{{ aap_poll_result.json.summary_fields.job_template.name | default('unknown') }}"
+
+- name: Display job completion summary
+  ansible.builtin.debug:
+    msg:
+      - "Job ID:    {{ aap_job_id }}"
+      - "Template:  {{ aap_job_template_name }}"
+      - "Status:    {{ aap_job_status }}"
+      - "Started:   {{ aap_job_started }}"
+      - "Finished:  {{ aap_job_finished }}"
+      - "Elapsed:   {{ aap_job_elapsed }}s"
+
+- name: Fetch job stdout log
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/jobs/{{ aap_job_id }}/stdout/?format=txt"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+  register: aap_job_stdout
+  failed_when: aap_job_stdout.status not in [200]
+  when: aap_fetch_stdout | bool
+  no_log: true
+
+- name: Display job stdout
+  ansible.builtin.debug:
+    msg: "{{ aap_job_stdout.content.split('\n') }}"
+  when:
+    - aap_fetch_stdout | bool
+    - aap_job_stdout is defined
+
+- name: Fail play if job did not succeed
+  ansible.builtin.fail:
+    msg: >-
+      Job {{ aap_job_id }} ({{ aap_job_template_name }}) finished with status
+      '{{ aap_job_status }}' — check the stdout above for details.
+  when:
+    - aap_fail_on_job_failure | bool
+    - aap_job_status not in ['successful']

@@ -1,0 +1,879 @@
+{# =============================================================================
+   aap_performance_report_v2.html.j2
+   Self-contained — no external CSS/JS/font dependencies.
+
+   v2 fixes vs v1:
+   - fmt_duration / badge macros: added {%- -%} whitespace stripping
+   - overflow booleans: now stored as real bools; template uses | bool
+   - null instance_group guard: (job.summary_fields.instance_group or {})
+   - sort crash on null 'finished': pre-filter with selectattr('finished')
+   - capacity % in cards: explicit | float on threshold comparisons
+   - node type "hop" excluded from capacity aggregate (hop nodes carry no forks)
+
+   v2 additions:
+   - Sticky nav bar with section jump-links
+   - Sortable table columns (vanilla JS, no CDN)
+   - @media print CSS — clean A4/letter printout
+   - Auto-refresh <meta> when report_auto_refresh_seconds > 0
+   - Workflow breakdown mini-table in the Failed Jobs section
+   - Schedule section (upcoming runs + overdue flags)
+   - Controller info row in header (version, HA, active node)
+   ============================================================================= #}
+
+{# ── Macros ────────────────────────────────────────────────────────────────── #}
+
+{# BUG FIX: added {%- -%} stripping. v1 macro bodies emitted surrounding
+   whitespace which broke inline rendering in table cells. #}
+{% macro fmt_duration(secs) -%}
+{%- set s = secs | default(0) | float | int -%}
+{%- set h = (s // 3600) -%}
+{%- set m = ((s % 3600) // 60) -%}
+{%- set sec = (s % 60) -%}
+{%- if h > 0 %}{{ h }}h {{ m }}m
+{%- elif m > 0 %}{{ m }}m {{ sec }}s
+{%- else %}{{ sec }}s
+{%- endif -%}
+{%- endmacro %}
+
+{% macro badge(status) -%}
+<span class="badge badge-{{ status | default('unknown') | lower }}">{{ status | default('unknown') }}</span>
+{%- endmacro %}
+
+{% macro job_type(t) -%}
+{%- if t == 'job' %}Playbook
+{%- elif t == 'workflow_job' %}Workflow
+{%- elif t == 'project_update' %}Project Sync
+{%- elif t == 'inventory_update' %}Inv. Sync
+{%- elif t == 'system_job' %}System
+{%- else %}{{ t | default('—') }}
+{%- endif -%}
+{%- endmacro %}
+
+{# BUG FIX: pct and threshold must both be floats before comparison. #}
+{% macro cap_bar(used, total, warn_pct, crit_pct) -%}
+{%- set pct = ((used | int) / ([total | int, 1] | max) * 100) | round(0) | int -%}
+{%- set cls = 'cap-crit' if pct >= (crit_pct | int) else ('cap-warn' if pct >= (warn_pct | int) else 'cap-ok') -%}
+<div class="cap-wrap" title="{{ used }}/{{ total }} forks ({{ pct }}%)">
+  <div class="cap-bar {{ cls }}" style="width:{{ [pct,100] | min }}%"></div>
+</div>
+<small class="cap-label">{{ used }}/{{ total }} ({{ pct }}%)</small>
+{%- endmacro %}
+
+{% macro node_badge(state) -%}
+<span class="badge {% if state == 'ready' %}badge-successful{% elif state in ['provisioning','installed','deprovision_started'] %}badge-running{% else %}badge-failed{% endif %}">{{ state | default('unknown') }}</span>
+{%- endmacro %}
+
+{# ── Top-failing template tally ────────────────────────────────────────────── #}
+{% set ns = namespace(tpl_counts={}) %}
+{% for name in metric_failed_template_names | default([]) %}
+{%   set _ = ns.tpl_counts.update({name: (ns.tpl_counts.get(name, 0) + 1)}) %}
+{% endfor %}
+{% set top_failing = ns.tpl_counts.items() | list | sort(attribute=1, reverse=True) %}
+
+{# ── Alert flags ───────────────────────────────────────────────────────────── #}
+{% set q_depth   = metric_queue_depth | int %}
+{% set fail_rate = metric_failure_rate_pct | float %}
+{% set cap_pct   = metric_capacity_pct | float %}
+{% set any_crit  = (q_depth   >= alert_queue_depth_crit      | int)
+                or (fail_rate >= alert_failure_rate_crit_pct  | int)
+                or (cap_pct   >= alert_capacity_crit_pct      | int) %}
+{% set any_warn  = (q_depth   >= alert_queue_depth_warn       | int)
+                or (fail_rate >= alert_failure_rate_warn_pct   | int)
+                or (cap_pct   >= alert_capacity_warn_pct       | int) %}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+{% if report_auto_refresh_seconds | int > 0 %}
+<meta http-equiv="refresh" content="{{ report_auto_refresh_seconds }}">
+{% endif %}
+<title>{{ report_title }} v{{ report_version }} — {{ report_ts }}</title>
+<style>
+/* ── Reset ──────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  background: #f0f2f5;
+  color: #1a1a2e;
+  line-height: 1.5;
+}
+a { color: #0d6efd; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Header ─────────────────────────────────────────────────────────────────── */
+.site-header {
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+  color: #fff;
+  padding: 18px 32px 14px;
+}
+.header-top { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.site-header h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: .02em; }
+.site-header h1 em { color: #e94560; font-style: normal; }
+.header-meta { font-size: 0.8rem; color: #a0aec0; text-align: right; line-height: 1.7; }
+.header-meta strong { color: #e2e8f0; }
+.header-ctrl {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,.1);
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  font-size: 0.76rem;
+  color: #94a3b8;
+}
+.header-ctrl span { color: #cbd5e1; }
+.header-ctrl strong { color: #fff; }
+{% if report_auto_refresh_seconds | int > 0 %}
+.refresh-pill {
+  background: rgba(34,197,94,.15);
+  color: #86efac;
+  border: 1px solid rgba(34,197,94,.3);
+  border-radius: 999px;
+  padding: 1px 10px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+{% endif %}
+
+/* ── Alert banner ────────────────────────────────────────────────────────────── */
+.alert-banner {
+  padding: 10px 32px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.alert-banner.crit { background: #fff0f0; color: #c0392b; border-left: 5px solid #e74c3c; }
+.alert-banner.warn { background: #fffbf0; color: #b7770d; border-left: 5px solid #f39c12; }
+.alert-item::before { content: "⚠  "; }
+
+/* ── Sticky navigation ────────────────────────────────────────────────────────── */
+.toc {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: #1e293b;
+  padding: 0 20px;
+  display: flex;
+  gap: 0;
+  overflow-x: auto;
+  box-shadow: 0 2px 6px rgba(0,0,0,.2);
+}
+.toc a {
+  color: #94a3b8;
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  padding: 10px 14px;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
+  transition: color .15s, border-color .15s;
+}
+.toc a:hover { color: #e2e8f0; border-color: #3b82f6; }
+
+/* ── Layout ──────────────────────────────────────────────────────────────────── */
+.page-body { max-width: 1440px; margin: 0 auto; padding: 22px 22px 56px; }
+
+/* ── Summary cards ────────────────────────────────────────────────────────────── */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 14px; margin-bottom: 26px; }
+.card {
+  background: #fff;
+  border-radius: 10px;
+  padding: 16px 14px 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  border-top: 4px solid #cbd5e1;
+}
+.card-label { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: #64748b; }
+.card-value { font-size: 2rem; font-weight: 800; line-height: 1.1; margin: 4px 0 2px; }
+.card-sub   { font-size: 0.72rem; color: #94a3b8; }
+.card-overflow { font-size: 0.66rem; color: #f97316; font-weight: 700; margin-top: 2px; }
+.card.c-blue   { border-color: #3b82f6; } .card.c-blue   .card-value { color: #2563eb; }
+.card.c-green  { border-color: #22c55e; } .card.c-green  .card-value { color: #16a34a; }
+.card.c-red    { border-color: #ef4444; } .card.c-red    .card-value { color: #dc2626; }
+.card.c-orange { border-color: #f97316; } .card.c-orange .card-value { color: #ea580c; }
+.card.c-yellow { border-color: #eab308; } .card.c-yellow .card-value { color: #ca8a04; }
+.card.c-purple { border-color: #a855f7; } .card.c-purple .card-value { color: #9333ea; }
+.card.c-slate  { border-color: #64748b; } .card.c-slate  .card-value { color: #475569; }
+
+/* ── Section ──────────────────────────────────────────────────────────────────── */
+.section { background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.07); margin-bottom: 22px; overflow: hidden; }
+.section-head {
+  padding: 12px 18px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.section-head h2 { font-size: 0.92rem; font-weight: 700; color: #1e293b; }
+.count-badge {
+  background: #e2e8f0; color: #475569;
+  border-radius: 999px; padding: 1px 9px;
+  font-size: 0.72rem; font-weight: 700;
+}
+.section-note { font-size: 0.72rem; color: #f97316; margin-left: auto; font-weight: 600; }
+.section-body { overflow-x: auto; }
+.empty-state { padding: 30px; text-align: center; color: #94a3b8; font-style: italic; }
+
+/* ── Tables ────────────────────────────────────────────────────────────────────── */
+table { width: 100%; border-collapse: collapse; font-size: 0.81rem; }
+th {
+  background: #f1f5f9; color: #475569; font-weight: 700;
+  text-transform: uppercase; font-size: 0.67rem; letter-spacing: .05em;
+  padding: 9px 13px; text-align: left; white-space: nowrap;
+  user-select: none;
+}
+th.sortable { cursor: pointer; }
+th.sortable:hover { background: #e2e8f0; color: #1e293b; }
+th[data-sort="asc"]::after  { content: " ▲"; color: #3b82f6; }
+th[data-sort="desc"]::after { content: " ▼"; color: #3b82f6; }
+td { padding: 7px 13px; border-top: 1px solid #f1f5f9; vertical-align: middle; }
+tr:hover td { background: #f8fafc; }
+.row-failed td        { background: #fff5f5; }
+.row-failed:hover td  { background: #ffeaea; }
+.row-error td         { background: #fff8f0; }
+.row-error:hover td   { background: #ffeedc; }
+.row-running td       { background: #f0f7ff; }
+.row-overdue td       { background: #fef9c3; }
+.truncate { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 0.78rem; }
+.text-muted  { color: #94a3b8; }
+.text-right  { text-align: right; }
+.text-center { text-align: center; }
+
+/* ── Status badges ─────────────────────────────────────────────────────────────── */
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.68rem; font-weight: 700; text-transform: capitalize; white-space: nowrap; }
+.badge-successful        { background: #dcfce7; color: #15803d; }
+.badge-failed            { background: #fee2e2; color: #b91c1c; }
+.badge-error             { background: #ffedd5; color: #c2410c; }
+.badge-running           { background: #dbeafe; color: #1d4ed8; }
+.badge-pending           { background: #f1f5f9; color: #475569; }
+.badge-waiting           { background: #fef9c3; color: #854d0e; }
+.badge-canceled          { background: #f3f4f6; color: #6b7280; }
+.badge-unknown           { background: #f1f5f9; color: #94a3b8; }
+.badge-ready             { background: #dcfce7; color: #15803d; }
+.badge-unavailable,
+.badge-deprovision_started,
+.badge-provisioning_failure { background: #fee2e2; color: #b91c1c; }
+.badge-provisioning,
+.badge-installed         { background: #dbeafe; color: #1d4ed8; }
+
+/* ── Node type chips ──────────────────────────────────────────────────────────── */
+.nt { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 0.67rem; font-weight: 700; }
+.nt-control   { background: #ede9fe; color: #6d28d9; }
+.nt-execution { background: #dbeafe; color: #1e40af; }
+.nt-hop       { background: #e5e7eb; color: #374151; }
+.nt-hybrid    { background: #d1fae5; color: #065f46; }
+
+/* ── Capacity bars ─────────────────────────────────────────────────────────────── */
+.cap-wrap  { background: #e2e8f0; border-radius: 999px; height: 8px; width: 130px; overflow: hidden; margin-bottom: 2px; }
+.cap-bar   { height: 100%; border-radius: 999px; }
+.cap-ok    { background: #22c55e; }
+.cap-warn  { background: #f59e0b; }
+.cap-crit  { background: #ef4444; }
+.cap-label { color: #64748b; font-size: 0.72rem; }
+
+/* ── Top-failing bar chart ─────────────────────────────────────────────────────── */
+.tpl-row { display: flex; align-items: center; gap: 10px; padding: 7px 18px; border-top: 1px solid #f1f5f9; }
+.tpl-name     { flex: 0 0 240px; font-size: 0.81rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpl-bar-wrap { flex: 1; background: #f1f5f9; border-radius: 4px; height: 14px; overflow: hidden; }
+.tpl-bar-fill { background: #ef4444; height: 100%; border-radius: 4px; }
+.tpl-count    { flex: 0 0 32px; font-weight: 700; font-size: 0.81rem; color: #b91c1c; text-align: right; }
+
+/* ── Workflow breakdown mini-grid ──────────────────────────────────────────────── */
+.breakdown-grid { display: flex; gap: 16px; flex-wrap: wrap; padding: 14px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+.breakdown-item { display: flex; flex-direction: column; align-items: center; background: #fff; border-radius: 8px; padding: 8px 16px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+.breakdown-label { font-size: 0.68rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; }
+.breakdown-value { font-size: 1.4rem; font-weight: 700; color: #dc2626; line-height: 1.1; }
+.breakdown-value.zero { color: #16a34a; }
+
+/* ── Schedule overdue pill ─────────────────────────────────────────────────────── */
+.pill-overdue { background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; border-radius: 999px; padding: 1px 8px; font-size: 0.68rem; font-weight: 700; }
+
+/* ── Footer ─────────────────────────────────────────────────────────────────────── */
+.site-footer { text-align: center; padding: 24px; color: #94a3b8; font-size: 0.73rem; line-height: 1.8; }
+
+/* ── Print ───────────────────────────────────────────────────────────────────────── */
+@media print {
+  body { background: #fff; font-size: 11px; }
+  .toc, .site-footer a { display: none; }
+  .site-header { background: #1e293b !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .section { break-inside: avoid; box-shadow: none; border: 1px solid #e2e8f0; }
+  .cards { grid-template-columns: repeat(4, 1fr); }
+  .page-body { padding: 12px; }
+  a[href]::after { content: ""; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ HEADER ══════════════════════════════════════════════════════════════════ -->
+<header class="site-header">
+  <div class="header-top">
+    <h1>🟥 <em>AAP</em> {{ report_title }} <small style="font-size:.75rem;font-weight:400;color:#64748b">v{{ report_version }}</small></h1>
+    <div class="header-meta">
+      <div><strong>Controller:</strong> {{ aap_url }}</div>
+      <div><strong>Generated:</strong> {{ report_ts }}</div>
+      <div><strong>Window:</strong> last {{ report_window_hours }}h</div>
+      {% if report_auto_refresh_seconds | int > 0 %}
+      <div><span class="refresh-pill">↻ auto-refresh {{ report_auto_refresh_seconds }}s</span></div>
+      {% endif %}
+    </div>
+  </div>
+  <div class="header-ctrl">
+    <div><strong>Version:</strong> <span>{{ aap_controller_version | default('—') }}</span></div>
+    <div><strong>Active node:</strong> <span>{{ aap_active_node | default('—') }}</span></div>
+    <div><strong>HA:</strong> <span>{{ 'Yes' if aap_controller_ha | default(false) | bool else 'No' }}</span></div>
+    <div><strong>Reported by:</strong> <span>{{ aap_report_user | default('—') }}</span></div>
+    <div><strong>Window start:</strong> <span>{{ report_window_start | regex_replace('T',' ') | regex_replace('Z',' UTC') }}</span></div>
+  </div>
+</header>
+
+<!-- ═══ ALERT BANNER ════════════════════════════════════════════════════════════ -->
+{% if any_crit or any_warn %}
+<div class="alert-banner {{ 'crit' if any_crit else 'warn' }}">
+  <strong>{{ 'CRITICAL' if any_crit else 'WARNING' }}</strong>
+  {% if q_depth   >= alert_queue_depth_crit      | int %}<span class="alert-item">Queue depth {{ q_depth }} ≥ critical ({{ alert_queue_depth_crit }})</span>{% elif q_depth >= alert_queue_depth_warn | int %}<span class="alert-item">Queue depth {{ q_depth }} ≥ warning ({{ alert_queue_depth_warn }})</span>{% endif %}
+  {% if fail_rate >= alert_failure_rate_crit_pct | int %}<span class="alert-item">Failure rate {{ metric_failure_rate_pct }}% ≥ critical ({{ alert_failure_rate_crit_pct }}%)</span>{% elif fail_rate >= alert_failure_rate_warn_pct | int %}<span class="alert-item">Failure rate {{ metric_failure_rate_pct }}% ≥ warning ({{ alert_failure_rate_warn_pct }}%)</span>{% endif %}
+  {% if cap_pct   >= alert_capacity_crit_pct     | int %}<span class="alert-item">Cluster capacity {{ metric_capacity_pct }}% ≥ critical ({{ alert_capacity_crit_pct }}%)</span>{% elif cap_pct >= alert_capacity_warn_pct | int %}<span class="alert-item">Cluster capacity {{ metric_capacity_pct }}% ≥ warning ({{ alert_capacity_warn_pct }}%)</span>{% endif %}
+  {% if metric_schedules_overdue | default([]) | length > 0 %}<span class="alert-item">{{ metric_schedules_overdue | length }} overdue schedule(s)</span>{% endif %}
+</div>
+{% endif %}
+
+<!-- ═══ STICKY NAV ══════════════════════════════════════════════════════════════ -->
+<nav class="toc" aria-label="Report sections">
+  <a href="#s-cards">Summary</a>
+  <a href="#s-queue">Queue</a>
+  <a href="#s-failed">Failed</a>
+  <a href="#s-top">Top Failing</a>
+  <a href="#s-nodes">Nodes</a>
+  <a href="#s-groups">Groups</a>
+  <a href="#s-schedules">Schedules</a>
+  <a href="#s-timeline">Timeline</a>
+  {% if metric_canceled_list | length > 0 %}<a href="#s-canceled">Canceled</a>{% endif %}
+</nav>
+
+<div class="page-body">
+
+<!-- ═══ SUMMARY CARDS ═══════════════════════════════════════════════════════════ -->
+<div class="cards" id="s-cards">
+
+  <div class="card {% if q_depth >= alert_queue_depth_crit | int %}c-red{% elif q_depth >= alert_queue_depth_warn | int %}c-yellow{% else %}c-slate{% endif %}">
+    <div class="card-label">Queue Depth</div>
+    <div class="card-value">{{ metric_queue_depth }}</div>
+    <div class="card-sub">{{ api_count_pending }} pending · {{ api_count_waiting }} waiting</div>
+  </div>
+
+  <div class="card c-blue">
+    <div class="card-label">Running Now</div>
+    <div class="card-value">{{ api_count_running }}</div>
+    <div class="card-sub">active jobs</div>
+    {% if metric_running_overflow | bool %}<div class="card-overflow">▲ showing {{ metric_running_list | length }} of {{ api_count_running }}</div>{% endif %}
+  </div>
+
+  <div class="card c-green">
+    <div class="card-label">Successful</div>
+    <div class="card-value">{{ api_count_successful }}</div>
+    <div class="card-sub">last {{ report_window_hours }}h</div>
+    {% if metric_successful_overflow | bool %}<div class="card-overflow">▲ sample of {{ api_count_successful }}</div>{% endif %}
+  </div>
+
+  <div class="card {% if api_count_failed | int > 0 %}c-red{% else %}c-green{% endif %}">
+    <div class="card-label">Failed</div>
+    <div class="card-value">{{ api_count_failed }}</div>
+    <div class="card-sub">last {{ report_window_hours }}h</div>
+  </div>
+
+  <div class="card {% if api_count_error | int > 0 %}c-orange{% else %}c-green{% endif %}">
+    <div class="card-label">Errors</div>
+    <div class="card-value">{{ api_count_error }}</div>
+    <div class="card-sub">last {{ report_window_hours }}h</div>
+  </div>
+
+  <div class="card {% if fail_rate >= alert_failure_rate_crit_pct | int %}c-red{% elif fail_rate >= alert_failure_rate_warn_pct | int %}c-yellow{% else %}c-green{% endif %}">
+    <div class="card-label">Success Rate</div>
+    <div class="card-value">{{ metric_success_rate_pct }}%</div>
+    <div class="card-sub">{{ metric_total_in_window }} jobs total</div>
+  </div>
+
+  <div class="card c-purple">
+    <div class="card-label">Avg Duration</div>
+    <div class="card-value" style="font-size:1.3rem">{{ fmt_duration(metric_avg_duration_s) }}</div>
+    <div class="card-sub">successful sample</div>
+  </div>
+
+  <div class="card {% if cap_pct >= alert_capacity_crit_pct | int %}c-red{% elif cap_pct >= alert_capacity_warn_pct | int %}c-yellow{% else %}c-blue{% endif %}">
+    <div class="card-label">Cluster Capacity</div>
+    <div class="card-value">{{ metric_capacity_pct }}%</div>
+    <div class="card-sub">{{ metric_consumed_capacity }}/{{ metric_total_capacity }} forks · {{ metric_nodes_total }} nodes</div>
+  </div>
+
+  <div class="card {% if metric_schedules_overdue | default([]) | length > 0 %}c-yellow{% else %}c-slate{% endif %}">
+    <div class="card-label">Schedules</div>
+    <div class="card-value">{{ api_count_schedules_enabled | default(0) }}</div>
+    <div class="card-sub">enabled · {{ metric_schedules_overdue | default([]) | length }} overdue</div>
+  </div>
+
+</div>
+
+
+<!-- ═══ SECTION 1 — JOB QUEUE ════════════════════════════════════════════════════ -->
+<div class="section" id="s-queue">
+  <div class="section-head">
+    <h2>🔄 Job Queue</h2>
+    <span class="count-badge">{{ api_count_running }} running · {{ api_count_pending }} pending · {{ api_count_waiting }} waiting</span>
+    {% if metric_running_overflow | bool %}<span class="section-note">⚠ showing first {{ metric_running_list | length }} running of {{ api_count_running }}</span>{% endif %}
+  </div>
+  <div class="section-body">
+    {% set queue_list = metric_running_list + metric_pending_list + metric_waiting_list %}
+    {% if queue_list | length == 0 %}
+    <div class="empty-state">Queue is empty — all quiet. ✓</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">ID</th>
+          <th class="sortable">Type</th>
+          <th class="sortable">Template / Name</th>
+          <th class="sortable">Status</th>
+          <th class="sortable">Started</th>
+          <th class="sortable">Elapsed</th>
+          <th class="sortable">Instance Group</th>
+          <th class="sortable">Launched By</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in queue_list %}
+        {# BUG FIX: safe null-guard for instance_group. v1 accessed .name directly
+           on what could be JSON null, raising AttributeError. #}
+        {%   set ig_name = (job.summary_fields.instance_group or {}).get('name', '—') %}
+        {%   set lb_name = (job.summary_fields.launched_by    or {}).get('name', '—') %}
+        <tr class="row-{{ job.status | default('unknown') | lower }}">
+          <td class="mono"><a href="{{ aap_url }}/#/jobs/{{ job.type | default('job') }}/{{ job.id }}/" target="_blank">{{ job.id }}</a></td>
+          <td>{{ job_type(job.type) }}</td>
+          <td class="truncate" title="{{ job.name | default('') }}">{{ job.name | default('—') }}</td>
+          <td>{{ badge(job.status) }}</td>
+          <td class="mono text-muted">{{ job.started | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td>{{ fmt_duration(job.elapsed | default(0)) }}</td>
+          <td>{{ ig_name }}</td>
+          <td class="text-muted">{{ lb_name }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 2 — FAILED & ERROR JOBS ══════════════════════════════════════════ -->
+<div class="section" id="s-failed">
+  <div class="section-head">
+    <h2>❌ Failed &amp; Error Jobs</h2>
+    <span class="count-badge">{{ api_count_failed }} failed · {{ api_count_error }} error · last {{ report_window_hours }}h</span>
+    {% if metric_failed_overflow | bool %}<span class="section-note">⚠ showing first {{ metric_failed_list | length }} of {{ api_count_failed }} failed</span>{% endif %}
+  </div>
+
+  <!-- Breakdown by job type (new in v2) -->
+  {% if metric_total_unhealthy | int > 0 %}
+  <div class="breakdown-grid">
+    <div class="breakdown-item">
+      <div class="breakdown-label">Playbook</div>
+      <div class="breakdown-value {% if metric_failed_playbook_count | int == 0 %}zero{% endif %}">{{ metric_failed_playbook_count }}</div>
+    </div>
+    <div class="breakdown-item">
+      <div class="breakdown-label">Workflow</div>
+      <div class="breakdown-value {% if metric_failed_workflow_count | int == 0 %}zero{% endif %}">{{ metric_failed_workflow_count }}</div>
+    </div>
+    <div class="breakdown-item">
+      <div class="breakdown-label">Project Sync</div>
+      <div class="breakdown-value {% if metric_failed_project_count | int == 0 %}zero{% endif %}">{{ metric_failed_project_count }}</div>
+    </div>
+    <div class="breakdown-item">
+      <div class="breakdown-label">Inv. Sync</div>
+      <div class="breakdown-value {% if metric_failed_inventory_count | int == 0 %}zero{% endif %}">{{ metric_failed_inventory_count }}</div>
+    </div>
+    <div class="breakdown-item">
+      <div class="breakdown-label">Errors</div>
+      <div class="breakdown-value {% if api_count_error | int == 0 %}zero{% endif %}">{{ api_count_error }}</div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="section-body">
+    {# BUG FIX: v1 sorted the combined list by 'finished' without guarding for null.
+       Fix: pre-filter to only jobs that have a finished timestamp, then append the rest. #}
+    {% set bad_with_finish    = (metric_failed_list + metric_error_list)
+                                | selectattr('finished', 'defined')
+                                | selectattr('finished', 'ne', none)
+                                | list
+                                | sort(attribute='finished', reverse=True) %}
+    {% set bad_without_finish = (metric_failed_list + metric_error_list)
+                                | rejectattr('finished', 'defined')
+                                | list %}
+    {% set bad_list = bad_with_finish + bad_without_finish %}
+    {% if bad_list | length == 0 %}
+    <div class="empty-state">No failed or error jobs in the last {{ report_window_hours }}h. ✓</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">ID</th>
+          <th class="sortable">Type</th>
+          <th class="sortable">Template / Name</th>
+          <th class="sortable">Status</th>
+          <th class="sortable">Started</th>
+          <th class="sortable">Finished</th>
+          <th class="sortable">Duration</th>
+          <th class="sortable">Launch Type</th>
+          <th>Explanation</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in bad_list %}
+        {%   set ig_name = (job.summary_fields.instance_group or {}).get('name', '—') %}
+        <tr class="row-{{ job.status | default('failed') | lower }}">
+          <td class="mono"><a href="{{ aap_url }}/#/jobs/{{ job.type | default('job') }}/{{ job.id }}/" target="_blank">{{ job.id }}</a></td>
+          <td>{{ job_type(job.type) }}</td>
+          <td class="truncate" title="{{ job.name | default('') }}">{{ job.name | default('—') }}</td>
+          <td>{{ badge(job.status) }}</td>
+          <td class="mono text-muted">{{ job.started  | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td class="mono text-muted">{{ job.finished | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td>{{ fmt_duration(job.elapsed | default(0)) }}</td>
+          <td class="text-muted">{{ job.launch_type | default('—') }}</td>
+          <td class="truncate" title="{{ job.job_explanation | default('') }}">{{ job.job_explanation | default('—') | truncate(90) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 3 — TOP FAILING TEMPLATES ════════════════════════════════════════ -->
+<div class="section" id="s-top">
+  <div class="section-head">
+    <h2>📊 Top Failing Job Templates</h2>
+    <span class="count-badge">{{ top_failing | length }} distinct templates · last {{ report_window_hours }}h</span>
+  </div>
+  <div class="section-body" style="padding:8px 0">
+    {% if top_failing | length == 0 %}
+    <div class="empty-state">No template failures in the reporting window. ✓</div>
+    {% else %}
+    {%   set max_count = top_failing[0][1] %}
+    {%   for name, count in top_failing[:15] %}
+    {%     set bar_width = (count / ([max_count, 1] | max) * 100) | round(0) | int %}
+    <div class="tpl-row">
+      <div class="tpl-name" title="{{ name }}">{{ name }}</div>
+      <div class="tpl-bar-wrap"><div class="tpl-bar-fill" style="width:{{ bar_width }}%"></div></div>
+      <div class="tpl-count">{{ count }}</div>
+    </div>
+    {%   endfor %}
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 4 — NODE HEALTH ══════════════════════════════════════════════════ -->
+<div class="section" id="s-nodes">
+  <div class="section-head">
+    <h2>🖥 Execution Node Health</h2>
+    <span class="count-badge">
+      {{ metric_nodes_healthy }} healthy ·
+      {% if metric_nodes_degraded | int > 0 %}{{ metric_nodes_degraded }} not-ready ·{% endif %}
+      {% if metric_nodes_with_errors | int > 0 %}{{ metric_nodes_with_errors }} with errors ·{% endif %}
+      {% if metric_nodes_disabled | int > 0 %}{{ metric_nodes_disabled }} disabled ·{% endif %}
+      {{ metric_nodes_total }} total
+    </span>
+  </div>
+  <div class="section-body">
+    {% if metric_instances | length == 0 %}
+    <div class="empty-state">No instance data returned from API.</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">Hostname</th>
+          <th class="sortable">Type</th>
+          <th class="sortable">State</th>
+          <th class="sortable">Enabled</th>
+          <th>Capacity (forks)</th>
+          <th class="sortable">CPU</th>
+          <th class="sortable">Memory</th>
+          <th class="sortable">Jobs Running</th>
+          <th class="sortable">Version</th>
+          <th>Errors</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inst in metric_instances %}
+        {%   set inst_errors = inst.errors | default('') %}
+        {%   set row_cls = '' if inst.enabled | default(true) else 'row-canceled' %}
+        {%   set row_cls = 'row-error' if inst_errors else row_cls %}
+        <tr class="{{ row_cls }}">
+          <td class="mono"><strong>{{ inst.hostname | default('—') }}</strong></td>
+          <td>
+            {%   if inst.node_type == 'control'   %}<span class="nt nt-control">control</span>
+            {%   elif inst.node_type == 'execution'%}<span class="nt nt-execution">execution</span>
+            {%   elif inst.node_type == 'hop'     %}<span class="nt nt-hop">hop</span>
+            {%   elif inst.node_type == 'hybrid'  %}<span class="nt nt-hybrid">hybrid</span>
+            {%   else %}<span class="nt">{{ inst.node_type | default('—') }}</span>{% endif %}
+          </td>
+          <td>{{ node_badge(inst.node_state | default('unknown')) }}</td>
+          <td class="text-center">{{ '✓' if inst.enabled | default(true) | bool else '✗' }}</td>
+          <td>
+            {{ cap_bar(inst.consumed_capacity | default(0),
+                       inst.capacity          | default(0),
+                       alert_capacity_warn_pct,
+                       alert_capacity_crit_pct) }}
+          </td>
+          <td class="text-muted">{{ inst.cpu    | default('—') }}</td>
+          <td class="text-muted">
+            {%   if inst.memory is defined and inst.memory %}
+              {{ (inst.memory | int / 1073741824) | round(1) }} GB
+            {%   else %}—{% endif %}
+          </td>
+          <td class="text-right">{{ inst.jobs_running | default(0) }}</td>
+          <td class="mono text-muted" style="font-size:0.72rem">{{ inst.version | default('—') }}</td>
+          <td>
+            {%   if inst_errors %}
+            <span style="color:#b91c1c;font-size:0.72rem" title="{{ inst_errors }}">{{ inst_errors | truncate(70) }}</span>
+            {%   else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 5 — INSTANCE GROUP CAPACITY ══════════════════════════════════════ -->
+<div class="section" id="s-groups">
+  <div class="section-head">
+    <h2>⚡ Instance Group Capacity</h2>
+    <span class="count-badge">{{ metric_instance_groups | length }} groups</span>
+  </div>
+  <div class="section-body">
+    {% if metric_instance_groups | length == 0 %}
+    <div class="empty-state">No instance group data returned from API.</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">Group Name</th>
+          <th>Capacity Utilisation</th>
+          <th class="sortable">Jobs Running</th>
+          <th class="sortable">Jobs Total</th>
+          <th class="sortable">Instances</th>
+          <th>Policy</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ig in metric_instance_groups %}
+        <tr>
+          <td><strong>{{ ig.name | default('—') }}</strong></td>
+          <td style="min-width:200px">
+            {{ cap_bar(ig.consumed_capacity | default(0),
+                       ig.capacity          | default(0),
+                       alert_capacity_warn_pct,
+                       alert_capacity_crit_pct) }}
+          </td>
+          <td class="text-right">{{ ig.jobs_running | default(0) }}</td>
+          <td class="text-right">{{ ig.jobs_total   | default(0) }}</td>
+          <td class="text-right">{{ ig.instances    | default([]) | length }}</td>
+          <td class="text-muted text-right">
+            {% if ig.policy_instance_minimum   | default(0) | int > 0 %}min={{ ig.policy_instance_minimum }} {% endif %}
+            {% if ig.policy_instance_percentage| default(0) | int > 0 %}{{ ig.policy_instance_percentage }}%{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 6 — UPCOMING SCHEDULES (new in v2) ═══════════════════════════════ -->
+<div class="section" id="s-schedules">
+  <div class="section-head">
+    <h2>📅 Schedules</h2>
+    <span class="count-badge">
+      {{ api_count_schedules_total | default(0) }} total ·
+      {{ api_count_schedules_enabled | default(0) }} enabled ·
+      {{ api_count_schedules_disabled | default(0) }} disabled
+    </span>
+    {% if metric_schedules_overdue | default([]) | length > 0 %}
+    <span class="section-note">⚠ {{ metric_schedules_overdue | length }} overdue</span>
+    {% endif %}
+  </div>
+  <div class="section-body">
+    {% if metric_schedules_upcoming | default([]) | length == 0 %}
+    <div class="empty-state">No enabled schedules found.</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">Name</th>
+          <th class="sortable">Template / Resource</th>
+          <th class="sortable">Next Run (UTC)</th>
+          <th class="sortable">Last Run (UTC)</th>
+          <th class="sortable">Timezone</th>
+          <th>RRULE</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for sch in metric_schedules_upcoming %}
+        {%   set is_overdue = (sch.next_run | default('') != '') and (sch.next_run < report_ts) %}
+        <tr class="{{ 'row-overdue' if is_overdue else '' }}">
+          <td>
+            {{ sch.name | default('—') }}
+            {% if is_overdue %}<span class="pill-overdue">overdue</span>{% endif %}
+          </td>
+          <td class="truncate" title="{{ sch.summary_fields.unified_job_template.name | default('') }}">
+            {{ (sch.summary_fields.unified_job_template or {}).get('name', '—') }}
+          </td>
+          <td class="mono text-muted">{{ sch.next_run  | default('—') | regex_replace('T',' ') | regex_replace('Z',' UTC') }}</td>
+          <td class="mono text-muted">{{ sch.dtstart   | default('—') | regex_replace('T',' ') | regex_replace('Z',' UTC') }}</td>
+          <td class="text-muted">{{ sch.timezone | default('—') }}</td>
+          <td class="mono text-muted truncate" title="{{ sch.rrule | default('') }}" style="font-size:0.68rem">{{ sch.rrule | default('—') | truncate(50) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 7 — RECENT ACTIVITY TIMELINE ═════════════════════════════════════ -->
+<div class="section" id="s-timeline">
+  <div class="section-head">
+    <h2>🕐 Recent Job Activity</h2>
+    <span class="count-badge">last {{ metric_recent_list | length }} jobs · {{ report_window_hours }}h window</span>
+  </div>
+  <div class="section-body">
+    {% if metric_recent_list | length == 0 %}
+    <div class="empty-state">No jobs found in the last {{ report_window_hours }}h.</div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">ID</th>
+          <th class="sortable">Type</th>
+          <th class="sortable">Template / Name</th>
+          <th class="sortable">Status</th>
+          <th class="sortable">Created</th>
+          <th class="sortable">Duration</th>
+          <th class="sortable">Inventory</th>
+          <th class="sortable">Launched By</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in metric_recent_list %}
+        {%   set inv_name = (job.summary_fields.inventory or {}).get('name', '—') %}
+        {%   set lb_name  = (job.summary_fields.launched_by or {}).get('name', '—') %}
+        <tr class="{% if job.status in ['failed','error'] %}row-{{ job.status }}{% elif job.status == 'running' %}row-running{% endif %}">
+          <td class="mono"><a href="{{ aap_url }}/#/jobs/{{ job.type | default('job') }}/{{ job.id }}/" target="_blank">{{ job.id }}</a></td>
+          <td>{{ job_type(job.type) }}</td>
+          <td class="truncate" title="{{ job.name | default('') }}">{{ job.name | default('—') }}</td>
+          <td>{{ badge(job.status) }}</td>
+          <td class="mono text-muted">{{ job.created | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td>{{ fmt_duration(job.elapsed | default(0)) }}</td>
+          <td class="text-muted truncate">{{ inv_name }}</td>
+          <td class="text-muted">{{ lb_name }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ═══ SECTION 8 — CANCELED JOBS (conditional) ══════════════════════════════════ -->
+{% if metric_canceled_list | length > 0 %}
+<div class="section" id="s-canceled">
+  <div class="section-head">
+    <h2>⏹ Canceled Jobs</h2>
+    <span class="count-badge">{{ api_count_canceled }} canceled · last {{ report_window_hours }}h</span>
+  </div>
+  <div class="section-body">
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable">ID</th>
+          <th class="sortable">Type</th>
+          <th class="sortable">Template / Name</th>
+          <th class="sortable">Started</th>
+          <th class="sortable">Canceled At</th>
+          <th class="sortable">Duration</th>
+          <th class="sortable">Launched By</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in metric_canceled_list %}
+        {%   set lb_name = (job.summary_fields.launched_by or {}).get('name', '—') %}
+        <tr>
+          <td class="mono"><a href="{{ aap_url }}/#/jobs/{{ job.type | default('job') }}/{{ job.id }}/" target="_blank">{{ job.id }}</a></td>
+          <td>{{ job_type(job.type) }}</td>
+          <td class="truncate" title="{{ job.name | default('') }}">{{ job.name | default('—') }}</td>
+          <td class="mono text-muted">{{ job.started  | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td class="mono text-muted">{{ job.finished | default('—') | regex_replace('T',' ') | regex_replace('\\..*Z',' UTC') }}</td>
+          <td>{{ fmt_duration(job.elapsed | default(0)) }}</td>
+          <td class="text-muted">{{ lb_name }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+</div><!-- /page-body -->
+
+<footer class="site-footer">
+  <div>Generated by <strong>aap_performance_report v{{ report_version }}</strong> Ansible role</div>
+  <div>{{ report_ts }} · window {{ report_window_start | regex_replace('T',' ') | regex_replace('Z',' UTC') }} → now ({{ report_window_hours }}h)</div>
+  <div><a href="{{ aap_url }}/#/jobs" target="_blank">Open AAP Jobs →</a> · <a href="{{ aap_url }}/#/instances" target="_blank">Execution Nodes →</a></div>
+</footer>
+
+<script>
+/* ── Sortable column headers ──────────────────────────────────────────────── */
+document.querySelectorAll('th.sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    const tbl  = th.closest('table');
+    const col  = Array.from(th.parentElement.children).indexOf(th);
+    const asc  = th.dataset.sort !== 'asc';
+
+    Array.from(tbl.querySelector('tbody').rows)
+      .sort((a, b) => {
+        const v1 = (a.cells[col] || {}).innerText.trim();
+        const v2 = (b.cells[col] || {}).innerText.trim();
+        const n1 = parseFloat(v1.replace(/[^0-9.\-]/g, ''));
+        const n2 = parseFloat(v2.replace(/[^0-9.\-]/g, ''));
+        if (!isNaN(n1) && !isNaN(n2)) return asc ? n1 - n2 : n2 - n1;
+        return asc ? v1.localeCompare(v2) : v2.localeCompare(v1);
+      })
+      .forEach(tr => tbl.querySelector('tbody').appendChild(tr));
+
+    tbl.querySelectorAll('th').forEach(t => delete t.dataset.sort);
+    th.dataset.sort = asc ? 'asc' : 'desc';
+  });
+});
+</script>
+
+</body>
+</html>

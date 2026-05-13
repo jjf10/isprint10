@@ -1,0 +1,44 @@
+---
+# Implements: Section 5.1 of AAP-API-Marketplace-Access.md
+# GET /api/v2/ping/  and  GET /api/galaxy/pulp/api/v3/status/
+
+- name: Ping AAP Controller (no auth required)
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/ping/"
+    method: GET
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+  register: aap_ping
+  failed_when: aap_ping.status not in [200]
+
+- name: Set controller health facts
+  ansible.builtin.set_fact:
+    aap_controller_version: "{{ aap_ping.json.version }}"
+    aap_controller_ha: "{{ aap_ping.json.ha }}"
+    aap_controller_active_node: "{{ aap_ping.json.active_node }}"
+
+- name: Display Controller health
+  ansible.builtin.debug:
+    msg:
+      - "AAP Controller: {{ aap_url }}"
+      - "Version:        {{ aap_controller_version }}"
+      - "HA enabled:     {{ aap_controller_ha }}"
+      - "Active node:    {{ aap_controller_active_node }}"
+      - "Instances:      {{ aap_ping.json.instances | map(attribute='node') | list }}"
+
+- name: Ping Private Automation Hub (no auth required)
+  ansible.builtin.uri:
+    url: "{{ pah_url }}/api/galaxy/pulp/api/v3/status/"
+    method: GET
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+  register: pah_ping
+  failed_when: pah_ping.status not in [200]
+  when: pah_url | length > 0
+
+- name: Display PAH health
+  ansible.builtin.debug:
+    msg:
+      - "PAH: {{ pah_url }}"
+      - "Versions: {{ pah_ping.json.versions | default({}) }}"
+  when: pah_url | length > 0

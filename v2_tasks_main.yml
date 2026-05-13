@@ -1,0 +1,67 @@
+---
+# =============================================================================
+# tasks/main.yml — aap_performance_report_v2  orchestration entry point
+# =============================================================================
+
+# ── Input validation ───────────────────────────────────────────────────────────
+- name: Validate required connection variables
+  ansible.builtin.assert:
+    that:
+      - aap_url   | length > 0
+      - aap_token | length > 0
+    fail_msg: |
+      aap_url and aap_token must be provided.
+      Export:  AAP_URL=https://<controller-fqdn>  AAP_TOKEN=<oauth2-token>
+      Or pass: -e aap_url=...  -e aap_token=...
+
+- name: Validate report_window_hours
+  ansible.builtin.assert:
+    that:
+      - report_window_hours | int > 0
+      - report_window_hours | int <= 8760
+    fail_msg: "report_window_hours must be between 1 and 8760."
+
+# ── Output directory ───────────────────────────────────────────────────────────
+- name: Create report output directory
+  ansible.builtin.file:
+    path: "{{ report_output_dir }}"
+    state: directory
+    mode: "0755"
+
+# ── Time anchors ───────────────────────────────────────────────────────────────
+- name: Establish report timestamps
+  ansible.builtin.set_fact:
+    report_ts:           "{{ ansible_date_time.iso8601 }}"
+    report_ts_safe:      "{{ ansible_date_time.iso8601_basic_short }}"
+    report_epoch:        "{{ ansible_date_time.epoch | int }}"
+    report_window_start: >-
+      {{ '%Y-%m-%dT%H:%M:%SZ' | strftime(
+           (ansible_date_time.epoch | int) - (report_window_hours | int * 3600)) }}
+
+- name: Log report parameters
+  ansible.builtin.debug:
+    msg:
+      - "AAP URL       : {{ aap_url }}"
+      - "Window        : {{ report_window_start }} → {{ report_ts }}"
+      - "Window length : {{ report_window_hours }}h"
+      - "Output dir    : {{ report_output_dir }}"
+      - "Auto-refresh  : {{ report_auto_refresh_seconds }}s (0 = disabled)"
+      - "API retries   : {{ api_retry_count }}x every {{ api_retry_delay }}s"
+
+# ── Pre-flight ─────────────────────────────────────────────────────────────────
+- name: Pre-flight checks (ping + token validation)
+  ansible.builtin.include_tasks: preflight.yml
+
+# ── Data gathering ─────────────────────────────────────────────────────────────
+- name: Gather job queue and history metrics
+  ansible.builtin.include_tasks: gather_job_metrics.yml
+
+- name: Gather node and capacity metrics
+  ansible.builtin.include_tasks: gather_node_metrics.yml
+
+- name: Gather schedule metrics
+  ansible.builtin.include_tasks: gather_schedule_metrics.yml
+
+# ── Report rendering ───────────────────────────────────────────────────────────
+- name: Render HTML report
+  ansible.builtin.include_tasks: render_report.yml

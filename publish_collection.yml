@@ -1,0 +1,73 @@
+---
+# Implements: Section 7.3 of AAP-API-Marketplace-Access.md
+# ansible-galaxy collection publish <tarball> --server <pah_url> --token <pah_token>
+
+- name: Verify collection tarball exists
+  ansible.builtin.stat:
+    path: "{{ collection_tarball }}"
+  register: aap_tarball_stat
+
+- name: Fail if tarball not found
+  ansible.builtin.fail:
+    msg: "Collection tarball not found: {{ collection_tarball }}"
+  when: not aap_tarball_stat.stat.exists
+
+- name: Publish collection to PAH
+  ansible.builtin.command:
+    argv:
+      - ansible-galaxy
+      - collection
+      - publish
+      - "{{ collection_tarball }}"
+      - "--server"
+      - "{{ pah_url }}"
+      - "--token"
+      - "{{ pah_token }}"
+      - "{{ '--ignore-certs' if not aap_validate_certs | bool else '' }}"
+  register: aap_publish_result
+  changed_when: aap_publish_result.rc == 0
+  failed_when: aap_publish_result.rc != 0
+  no_log: true
+
+- name: Display publish output
+  ansible.builtin.debug:
+    msg: "{{ aap_publish_result.stdout_lines }}"
+
+- name: Display publish warnings if any
+  ansible.builtin.debug:
+    msg: "WARNINGS: {{ aap_publish_result.stderr_lines }}"
+  when: aap_publish_result.stderr_lines | length > 0
+
+- name: Poll PAH import task for completion
+  ansible.builtin.uri:
+    url: "{{ pah_url }}/api/galaxy/pulp/api/v3/tasks/?ordering=-pulp_created&limit=1"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ pah_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+  register: aap_pah_task_poll
+  until: >-
+    aap_pah_task_poll.json.results | length > 0 and
+    aap_pah_task_poll.json.results[0].state in ['completed', 'failed', 'canceled']
+  retries: 20
+  delay: 10
+  failed_when: aap_pah_task_poll.status not in [200]
+  no_log: true
+
+- name: Set import task result facts
+  ansible.builtin.set_fact:
+    pah_import_state: "{{ aap_pah_task_poll.json.results[0].state }}"
+    pah_import_task_href: "{{ aap_pah_task_poll.json.results[0].pulp_href }}"
+
+- name: Display PAH import task result
+  ansible.builtin.debug:
+    msg:
+      - "PAH import task state: {{ pah_import_state }}"
+      - "Task href: {{ pah_import_task_href }}"
+      - "Collection is now in staging — run approve_collection action to publish it"
+
+- name: Fail if PAH import task did not complete successfully
+  ansible.builtin.fail:
+    msg: "PAH import task finished with state '{{ pah_import_state }}'"
+  when: pah_import_state != 'completed'

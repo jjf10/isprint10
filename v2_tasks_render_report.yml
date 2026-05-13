@@ -1,0 +1,37 @@
+---
+# =============================================================================
+# render_report.yml — v2
+# =============================================================================
+
+- name: Set report file paths
+  ansible.builtin.set_fact:
+    report_file:        "{{ report_output_dir }}/aap-perf-v2-{{ report_ts_safe }}.html"
+    report_file_latest: "{{ report_output_dir }}/aap-perf-v2-latest.html"
+
+- name: Render HTML report from v2 template
+  ansible.builtin.template:
+    src:  aap_performance_report_v2.html.j2
+    dest: "{{ report_file }}"
+    mode: "0644"
+
+- name: Update latest symlink
+  ansible.builtin.file:
+    src:   "{{ report_file }}"
+    dest:  "{{ report_file_latest }}"
+    state: link
+    force: true
+
+- name: Report delivery summary
+  ansible.builtin.debug:
+    msg:
+      - "================================================="
+      - " AAP Performance Report v2 — complete"
+      - "================================================="
+      - " File   : {{ report_file }}"
+      - " Latest : {{ report_file_latest }}"
+      - ""
+      - " View options:"
+      - "   firefox  {{ report_file }}"
+      - "   scp <host>:{{ report_file }} ~/Desktop/"
+      - "   python3 -m http.server 8080 --directory {{ report_output_dir }}"
+      - "================================================="

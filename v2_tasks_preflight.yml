@@ -1,0 +1,69 @@
+---
+# =============================================================================
+# preflight.yml — connectivity and token validation
+# Fails fast with a clear message instead of making 9 API calls that all 401.
+# =============================================================================
+
+# ── Ping (no auth — tests network path and AAP version) ───────────────────────
+- name: "API: /api/v2/ping/ — connectivity check"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/ping/"
+    method: GET
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_ping
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_ping is not failed
+
+- name: Log controller version from ping
+  ansible.builtin.set_fact:
+    aap_controller_version: "{{ _r_ping.json.version  | default('unknown') }}"
+    aap_controller_ha:      "{{ _r_ping.json.ha        | default(false) | bool }}"
+    aap_active_node:        "{{ _r_ping.json.active_node | default('unknown') }}"
+
+- name: Display controller info
+  ansible.builtin.debug:
+    msg:
+      - "Controller version : {{ aap_controller_version }}"
+      - "HA mode            : {{ aap_controller_ha }}"
+      - "Active node        : {{ aap_active_node }}"
+
+# ── Token validation (GET /api/v2/me/) ────────────────────────────────────────
+- name: "API: /api/v2/me/ — validate token identity"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/me/"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200, 401]
+  register: _r_me
+  no_log: true    # token is in the header; suppress from logs
+
+- name: Fail clearly if token is expired or invalid
+  ansible.builtin.fail:
+    msg: |
+      AAP token validation failed — HTTP 401 Unauthorized.
+      The aap_token is expired, revoked, or invalid.
+
+      Generate a fresh token:
+        curl -sk -u <admin>:<password> -X POST \
+          {{ aap_url }}/api/v2/tokens/ \
+          -H 'Content-Type: application/json' \
+          -d '{"description":"report-token","application":null,"scope":"read"}'
+  when: _r_me.status == 401
+
+- name: Set authenticated user facts
+  ansible.builtin.set_fact:
+    aap_report_user:        "{{ _r_me.json.username      | default('unknown') }}"
+    aap_report_superuser:   "{{ _r_me.json.is_superuser  | default(false) | bool }}"
+
+- name: Display authenticated identity
+  ansible.builtin.debug:
+    msg:
+      - "Token valid — authenticated as : {{ aap_report_user }}"
+      - "Is superuser                   : {{ aap_report_superuser }}"
+      - "Note: non-superuser tokens only see objects they have RBAC access to."

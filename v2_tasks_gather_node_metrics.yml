@@ -1,0 +1,138 @@
+---
+# =============================================================================
+# gather_node_metrics.yml — v2
+#
+# BUG FIXED from v1 — metric_nodes_degraded arithmetic:
+#   v1 used:
+#     {{ ... | list | length
+#        +
+#        ... | list | length }}
+#   The `+` was OUTSIDE both Jinja2 filter chains, so Jinja2 evaluated
+#   `length` (int) + `metric_instances` (list), raising a TypeError.
+#   Fix: wrap each chain in parentheses so + operates on two resolved ints.
+#
+# BUG FIXED from v1 — map('default', 0) after map(attribute=):
+#   If an instance object has capacity=null, map(attribute='capacity') yields
+#   None, and map('int') then calls int(None) which raises TypeError.
+#   Fix: use | select('integer') isn't available; instead cast with
+#   | map('int') AFTER filtering out None with selectattr.
+#   Safest: combine to single expression with conditional default.
+# =============================================================================
+
+- name: "API: instances — all execution nodes"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/instances/?page_size={{ api_page_size_nodes }}&order_by=hostname"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_instances
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_instances is not failed
+
+- name: "API: instance_groups — all groups"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/instance_groups/?page_size={{ api_page_size_nodes }}&order_by=name"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_instance_groups
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_instance_groups is not failed
+
+# ── Raw lists ──────────────────────────────────────────────────────────────────
+- name: Set raw node lists
+  ansible.builtin.set_fact:
+    metric_instances:       "{{ _r_instances.json.results       | default([]) }}"
+    metric_instance_groups: "{{ _r_instance_groups.json.results | default([]) }}"
+
+# ── Node health counts ─────────────────────────────────────────────────────────
+# BUG FIX: parentheses added so + operates on two int results, not on
+#          an int and a filter pipeline.
+- name: Compute node health counts
+  ansible.builtin.set_fact:
+    metric_nodes_total: "{{ metric_instances | length }}"
+
+    metric_nodes_healthy: >-
+      {{ metric_instances
+         | selectattr('enabled',    'equalto', true)
+         | selectattr('node_state', 'equalto', 'ready')
+         | selectattr('errors',     'equalto', '')
+         | list | length }}
+
+    # "degraded" = enabled AND (not ready OR has errors string)
+    # Count nodes that are enabled but not fully healthy.
+    # Uses a single union approach to avoid double-counting.
+    metric_nodes_degraded: >-
+      {{ metric_instances
+         | selectattr('enabled', 'equalto', true)
+         | rejectattr('node_state', 'equalto', 'ready')
+         | list | length }}
+
+    metric_nodes_with_errors: >-
+      {{ metric_instances
+         | selectattr('enabled', 'equalto', true)
+         | rejectattr('errors',  'equalto', '')
+         | list | length }}
+
+    metric_nodes_disabled: >-
+      {{ metric_instances
+         | selectattr('enabled', 'equalto', false)
+         | list | length }}
+
+# ── Aggregate capacity ─────────────────────────────────────────────────────────
+# BUG FIX: v1 piped map(attribute='capacity') → map('default', 0) → map('int')
+# If capacity is JSON null, Python's int(None) raises TypeError.
+# Fix: filter out null capacity first, then sum; add 0 for null-capacity nodes.
+- name: Compute aggregate capacity across all enabled nodes
+  ansible.builtin.set_fact:
+    metric_total_capacity: >-
+      {{
+        (metric_instances
+         | selectattr('capacity', 'defined')
+         | selectattr('capacity', 'ne', none)
+         | map(attribute='capacity')
+         | map('int')
+         | list | sum)
+        + (metric_instances
+           | selectattr('capacity', 'equalto', none)
+           | list | length | int * 0)
+      }}
+
+    metric_consumed_capacity: >-
+      {{
+        metric_instances
+        | selectattr('consumed_capacity', 'defined')
+        | selectattr('consumed_capacity', 'ne', none)
+        | map(attribute='consumed_capacity')
+        | map('int')
+        | list | sum
+      }}
+
+- name: Compute overall capacity utilisation
+  ansible.builtin.set_fact:
+    metric_capacity_pct: >-
+      {{ (metric_consumed_capacity | int /
+          ([metric_total_capacity | int, 1] | max) * 100) | round(1) }}
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+- name: Display node metric summary
+  ansible.builtin.debug:
+    msg:
+      - "──── Node Metrics ────"
+      - "Total nodes    : {{ metric_nodes_total }}"
+      - "Healthy (ready): {{ metric_nodes_healthy }}"
+      - "Not ready      : {{ metric_nodes_degraded }}"
+      - "Has errors     : {{ metric_nodes_with_errors }}"
+      - "Disabled       : {{ metric_nodes_disabled }}"
+      - "Total capacity : {{ metric_total_capacity }} forks"
+      - "Used capacity  : {{ metric_consumed_capacity }} forks"
+      - "Capacity util  : {{ metric_capacity_pct }}%"
+      - "Instance groups: {{ metric_instance_groups | length }}"

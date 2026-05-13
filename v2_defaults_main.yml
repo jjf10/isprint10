@@ -1,0 +1,46 @@
+---
+# =============================================================================
+# defaults/main.yml — aap_performance_report_v2
+# All variables can be overridden at playbook or extra-vars level.
+# =============================================================================
+
+# ── Connection ─────────────────────────────────────────────────────────────────
+aap_url:            "{{ lookup('env', 'AAP_URL')   | default('', true) }}"
+aap_token:          "{{ lookup('env', 'AAP_TOKEN') | default('', true) }}"
+aap_validate_certs: false
+
+# ── Report metadata ────────────────────────────────────────────────────────────
+report_version:        "2"
+report_title:          "AAP Performance Report"
+report_output_dir:     "/tmp/aap-reports"
+
+# ── Report window ──────────────────────────────────────────────────────────────
+# Look-back window for failed / successful / error / canceled job analysis.
+# Running / pending / waiting jobs are always shown (they are live, not windowed).
+report_window_hours: 24
+
+# ── Live-dashboard auto-refresh ────────────────────────────────────────────────
+# Set to 0 to disable.  300 = refresh every 5 min when served via http.server.
+report_auto_refresh_seconds: 0
+
+# ── Alert thresholds ──────────────────────────────────────────────────────────
+# These drive colour-coding in cards, rows, and the alert banner.
+alert_queue_depth_warn:       5    # pending+waiting → yellow
+alert_queue_depth_crit:      15    # pending+waiting → red
+alert_failure_rate_warn_pct: 10    # % (failed+error)/total → yellow
+alert_failure_rate_crit_pct: 25    # % (failed+error)/total → red
+alert_capacity_warn_pct:     75    # per-node consumed/total → yellow row
+alert_capacity_crit_pct:     90    # per-node consumed/total → red row
+
+# ── API resilience ─────────────────────────────────────────────────────────────
+api_retry_count: 3    # retry failed API calls this many times
+api_retry_delay: 5    # seconds between retries
+
+# ── API page sizes ─────────────────────────────────────────────────────────────
+# .count in the API response is always the true total regardless of page_size.
+# page_size only controls how many rows appear in the detail tables.
+api_page_size_queue:     100   # running / pending / waiting detail rows
+api_page_size_window:    200   # failed / error / successful / canceled rows
+api_page_size_recent:     50   # recent-activity timeline rows
+api_page_size_nodes:     100   # instances and instance groups
+api_page_size_schedules:  25   # upcoming schedule rows

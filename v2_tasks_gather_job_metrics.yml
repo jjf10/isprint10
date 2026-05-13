@@ -1,0 +1,243 @@
+---
+# =============================================================================
+# gather_job_metrics.yml — v2
+#
+# BUG FIXED from v1: URLs were written as YAML >- multi-line block scalars.
+# YAML folds the line-break to a SPACE, producing URLs like:
+#   /api/v2/unified_jobs/?status=running &page_size=100   ← space = HTTP 400
+# All URLs are now single-line strings.
+#
+# .count in every response is the API's real total, unaffected by page_size.
+# page_size caps only the detail rows shown in tables.
+# =============================================================================
+
+# ── Live queue ─────────────────────────────────────────────────────────────────
+- name: "API: unified_jobs — running"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=running&page_size={{ api_page_size_queue }}&order_by=-started"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_running
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_running is not failed
+
+- name: "API: unified_jobs — pending"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=pending&page_size={{ api_page_size_queue }}&order_by=-created"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_pending
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_pending is not failed
+
+- name: "API: unified_jobs — waiting"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=waiting&page_size={{ api_page_size_queue }}&order_by=-created"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_waiting
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_waiting is not failed
+
+# ── Window: completed / terminal ──────────────────────────────────────────────
+- name: "API: unified_jobs — failed in window"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=failed&created__gt={{ report_window_start }}&page_size={{ api_page_size_window }}&order_by=-finished"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_failed
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_failed is not failed
+
+- name: "API: unified_jobs — error in window"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=error&created__gt={{ report_window_start }}&page_size={{ api_page_size_window }}&order_by=-finished"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_error
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_error is not failed
+
+- name: "API: unified_jobs — successful in window"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=successful&created__gt={{ report_window_start }}&page_size={{ api_page_size_window }}&order_by=-finished"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_successful
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_successful is not failed
+
+- name: "API: unified_jobs — canceled in window"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?status=canceled&created__gt={{ report_window_start }}&page_size=50&order_by=-finished"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_canceled
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_canceled is not failed
+
+# ── Recent jobs — all statuses, drives the activity timeline ──────────────────
+- name: "API: unified_jobs — recent {{ api_page_size_recent }} (all statuses)"
+  ansible.builtin.uri:
+    url: "{{ aap_url }}/api/v2/unified_jobs/?created__gt={{ report_window_start }}&page_size={{ api_page_size_recent }}&order_by=-created"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ aap_token }}"
+    validate_certs: "{{ aap_validate_certs }}"
+    return_content: true
+    status_code: [200]
+  register: _r_recent
+  retries: "{{ api_retry_count }}"
+  delay:   "{{ api_retry_delay }}"
+  until:   _r_recent is not failed
+
+# ── Consolidate raw lists ──────────────────────────────────────────────────────
+- name: Set raw job lists from API responses
+  ansible.builtin.set_fact:
+    metric_running_list:    "{{ _r_running.json.results    | default([]) }}"
+    metric_pending_list:    "{{ _r_pending.json.results    | default([]) }}"
+    metric_waiting_list:    "{{ _r_waiting.json.results    | default([]) }}"
+    metric_failed_list:     "{{ _r_failed.json.results     | default([]) }}"
+    metric_error_list:      "{{ _r_error.json.results      | default([]) }}"
+    metric_successful_list: "{{ _r_successful.json.results | default([]) }}"
+    metric_canceled_list:   "{{ _r_canceled.json.results   | default([]) }}"
+    metric_recent_list:     "{{ _r_recent.json.results     | default([]) }}"
+
+    # True totals — API .count is accurate regardless of page_size
+    api_count_running:    "{{ _r_running.json.count    | default(0) | int }}"
+    api_count_pending:    "{{ _r_pending.json.count    | default(0) | int }}"
+    api_count_waiting:    "{{ _r_waiting.json.count    | default(0) | int }}"
+    api_count_failed:     "{{ _r_failed.json.count     | default(0) | int }}"
+    api_count_error:      "{{ _r_error.json.count      | default(0) | int }}"
+    api_count_successful: "{{ _r_successful.json.count | default(0) | int }}"
+    api_count_canceled:   "{{ _r_canceled.json.count   | default(0) | int }}"
+
+    # BUG FIXED from v1: stored as booleans, not strings.
+    # v1 stored "{{ ... is not none }}" which produced the STRING "True"/"False".
+    # In Jinja2 templates, the string "False" is TRUTHY. Fix: cast via | bool.
+    metric_running_overflow:    "{{ (_r_running.json.next    is not none) | bool }}"
+    metric_failed_overflow:     "{{ (_r_failed.json.next     is not none) | bool }}"
+    metric_successful_overflow: "{{ (_r_successful.json.next is not none) | bool }}"
+
+# ── Derived summary metrics ────────────────────────────────────────────────────
+- name: Compute summary and rate metrics
+  ansible.builtin.set_fact:
+    metric_queue_depth: "{{ (api_count_pending | int) + (api_count_waiting | int) }}"
+
+    metric_total_in_window: >-
+      {{ (api_count_failed     | int)
+       + (api_count_error      | int)
+       + (api_count_successful | int)
+       + (api_count_canceled   | int) }}
+
+    metric_total_unhealthy: "{{ (api_count_failed | int) + (api_count_error | int) }}"
+
+- name: Compute success rate and failure rate
+  ansible.builtin.set_fact:
+    metric_success_rate_pct: >-
+      {{ ((api_count_successful | int) /
+          ([metric_total_in_window | int, 1] | max) * 100) | round(1) }}
+
+    metric_failure_rate_pct: >-
+      {{ ((metric_total_unhealthy | int) /
+          ([metric_total_in_window | int, 1] | max) * 100) | round(1) }}
+
+# ── Workflow breakdown (new in v2) ─────────────────────────────────────────────
+# Derived from the detail lists already fetched — no extra API calls.
+- name: Compute workflow job breakdowns
+  ansible.builtin.set_fact:
+    metric_failed_playbook_count: >-
+      {{ metric_failed_list
+         | selectattr('type', 'equalto', 'job')
+         | list | length }}
+    metric_failed_workflow_count: >-
+      {{ metric_failed_list
+         | selectattr('type', 'equalto', 'workflow_job')
+         | list | length }}
+    metric_failed_project_count: >-
+      {{ metric_failed_list
+         | selectattr('type', 'equalto', 'project_update')
+         | list | length }}
+    metric_failed_inventory_count: >-
+      {{ metric_failed_list
+         | selectattr('type', 'equalto', 'inventory_update')
+         | list | length }}
+
+# ── Average duration from successful sample ────────────────────────────────────
+- name: Compute average job duration from successful sample
+  ansible.builtin.set_fact:
+    metric_avg_duration_s: >-
+      {{
+        (metric_successful_list
+         | selectattr('elapsed', 'defined')
+         | map(attribute='elapsed')
+         | map('float')
+         | list
+         | sum
+         / ([metric_successful_list
+             | selectattr('elapsed', 'defined') | list | length, 1] | max)
+        ) | round(0) | int
+      }}
+
+# ── Template failure tally — flat name list, counted in Jinja2 template ────────
+- name: Extract template names from failed and error jobs
+  ansible.builtin.set_fact:
+    metric_failed_template_names: >-
+      {{
+        (metric_failed_list + metric_error_list)
+        | selectattr('summary_fields',             'defined')
+        | selectattr('summary_fields.job_template','defined')
+        | map(attribute='summary_fields.job_template.name')
+        | list
+      }}
+
+# ── Console summary ────────────────────────────────────────────────────────────
+- name: Display job metric summary
+  ansible.builtin.debug:
+    msg:
+      - "──── Job Metrics (window: last {{ report_window_hours }}h) ────"
+      - "Running now    : {{ api_count_running }}"
+      - "Queue depth    : {{ metric_queue_depth }} ({{ api_count_pending }} pending + {{ api_count_waiting }} waiting)"
+      - "Successful     : {{ api_count_successful }}"
+      - "Failed         : {{ api_count_failed }} (playbook={{ metric_failed_playbook_count }} workflow={{ metric_failed_workflow_count }} project={{ metric_failed_project_count }} inventory={{ metric_failed_inventory_count }})"
+      - "Error          : {{ api_count_error }}"
+      - "Canceled       : {{ api_count_canceled }}"
+      - "Total in window: {{ metric_total_in_window }}"
+      - "Success rate   : {{ metric_success_rate_pct }}%"
+      - "Failure rate   : {{ metric_failure_rate_pct }}%"
+      - "Avg duration   : {{ metric_avg_duration_s }}s (successful sample)"
