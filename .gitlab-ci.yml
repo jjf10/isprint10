@@ -1,0 +1,229 @@
+---
+# ──────────────────────────────────────────────────────────────────
+# GitLab CI – Build & Publish Ansible Collection to Automation Hub
+# Docker image pulled from internal Nexus registry.
+# curl-only publish + poll loop with metrics output.
+# ──────────────────────────────────────────────────────────────────
+
+variables:
+  # ── Nexus ──────────────────────────────────────────────────────
+  NEXUS_REGISTRY:   "nexus.example.internal:8443"          # change me
+  NEXUS_REPO:       "docker-hosted"                        # change me
+  DOCKER_IMAGE:     "${NEXUS_REGISTRY}/${NEXUS_REPO}/ubi9-minimal:latest"
+
+  # ── Automation Hub ─────────────────────────────────────────────
+  HUB_URL:          "https://hub.example.internal"         # change me
+  HUB_REPO:         "published"                            # namespace/staging repo
+  # HUB_TOKEN injected as a masked CI/CD variable
+
+  # ── Collection build ───────────────────────────────────────────
+  COLLECTION_NAMESPACE: "myorg"                            # change me
+  COLLECTION_NAME:      "myapp"                            # change me
+  BUILD_DIR:            "build"
+
+  # ── Poll settings ──────────────────────────────────────────────
+  POLL_INTERVAL_SEC: "10"
+  POLL_TIMEOUT_SEC:  "300"
+
+default:
+  image: "${DOCKER_IMAGE}"
+  tags:
+    - docker
+
+stages:
+  - build
+  - publish
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE: build
+# ══════════════════════════════════════════════════════════════════
+build-collection:
+  stage: build
+  before_script:
+    - mkdir -p "${BUILD_DIR}"
+    # Derive version from galaxy.yml
+    - |
+      COLLECTION_VERSION=$(grep '^version:' galaxy.yml | awk '{print $2}' | tr -d '"'"'"' ')
+      echo "COLLECTION_VERSION=${COLLECTION_VERSION}" >> build.env
+      echo "Building ${COLLECTION_NAMESPACE}-${COLLECTION_NAME}-${COLLECTION_VERSION}"
+
+  script:
+    - |
+      source build.env
+      TARBALL="${COLLECTION_NAMESPACE}-${COLLECTION_NAME}-${COLLECTION_VERSION}.tar.gz"
+
+      # Build using ansible-galaxy if available, otherwise tar
+      if command -v ansible-galaxy &>/dev/null; then
+        ansible-galaxy collection build --output-path "${BUILD_DIR}" --force
+      else
+        tar -czf "${BUILD_DIR}/${TARBALL}" \
+          --exclude=".git" \
+          --exclude="${BUILD_DIR}" \
+          --exclude="*.retry" \
+          .
+      fi
+
+      echo "TARBALL=${TARBALL}" >> build.env
+      echo "Built: ${BUILD_DIR}/${TARBALL}"
+      ls -lh "${BUILD_DIR}/"
+
+  artifacts:
+    paths:
+      - "${BUILD_DIR}/"
+    reports:
+      dotenv: build.env
+    expire_in: 1 hour
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE: publish
+# ══════════════════════════════════════════════════════════════════
+publish-to-hub:
+  stage: publish
+  needs:
+    - job: build-collection
+      artifacts: true
+  variables:
+    GIT_STRATEGY: none          # artifacts only — no repo checkout needed
+
+  script:
+    # ── 0. Validate prerequisites ─────────────────────────────────
+    - |
+      echo "=== PRE-FLIGHT ==="
+      : "${HUB_TOKEN:?HUB_TOKEN CI/CD variable is not set}"
+      : "${TARBALL:?TARBALL not found in build artifacts}"
+
+      TARBALL_PATH="${BUILD_DIR}/${TARBALL}"
+      if [ ! -f "${TARBALL_PATH}" ]; then
+        echo "ERROR: tarball not found at ${TARBALL_PATH}"
+        exit 1
+      fi
+
+      TARBALL_SIZE=$(du -sh "${TARBALL_PATH}" | cut -f1)
+      echo "Tarball : ${TARBALL_PATH} (${TARBALL_SIZE})"
+      echo "Hub URL : ${HUB_URL}"
+      echo "Repo    : ${HUB_REPO}"
+
+    # ── 1. Upload (publish) ───────────────────────────────────────
+    - |
+      echo ""
+      echo "=== UPLOADING COLLECTION ==="
+      UPLOAD_START=$(date +%s)
+
+      HTTP_RESPONSE=$(curl --silent \
+        --write-out "\n%{http_code}" \
+        --max-time 120 \
+        --request POST \
+        --header "Authorization: Token ${HUB_TOKEN}" \
+        --form "file=@${TARBALL_PATH};type=application/gzip" \
+        "${HUB_URL}/api/automation-hub/v3/plugin/ansible/content/${HUB_REPO}/collections/artifacts/")
+
+      HTTP_BODY=$(echo "${HTTP_RESPONSE}" | head -n -1)
+      HTTP_CODE=$(echo "${HTTP_RESPONSE}" | tail -n1)
+
+      echo "HTTP status : ${HTTP_CODE}"
+      echo "Response    : ${HTTP_BODY}"
+
+      if [ "${HTTP_CODE}" != "202" ]; then
+        echo "ERROR: Upload failed with HTTP ${HTTP_CODE}"
+        exit 1
+      fi
+
+      TASK_HREF=$(echo "${HTTP_BODY}" | grep -o '"task"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | grep -o '"[^"]*"$' | tr -d '"')
+
+      if [ -z "${TASK_HREF}" ]; then
+        echo "ERROR: Could not extract task href from response"
+        echo "Full response: ${HTTP_BODY}"
+        exit 1
+      fi
+
+      echo "Task href   : ${TASK_HREF}"
+      UPLOAD_ELAPSED=$(( $(date +%s) - UPLOAD_START ))
+      echo "Upload time : ${UPLOAD_ELAPSED}s"
+
+    # ── 2. Poll task until terminal state ─────────────────────────
+    - |
+      echo ""
+      echo "=== POLLING IMPORT TASK ==="
+      POLL_START=$(date +%s)
+      POLL_COUNT=0
+      TASK_STATE="waiting"
+      TASK_DETAIL=""
+
+      # Resolve full task URL (href may be relative or absolute)
+      case "${TASK_HREF}" in
+        http*) TASK_URL="${TASK_HREF}" ;;
+        *)     TASK_URL="${HUB_URL}${TASK_HREF}" ;;
+      esac
+
+      while true; do
+        NOW=$(date +%s)
+        ELAPSED=$(( NOW - POLL_START ))
+
+        if [ "${ELAPSED}" -ge "${POLL_TIMEOUT_SEC}" ]; then
+          echo "ERROR: Polling timed out after ${ELAPSED}s (limit ${POLL_TIMEOUT_SEC}s)"
+          exit 1
+        fi
+
+        TASK_RESPONSE=$(curl --silent \
+          --max-time 30 \
+          --header "Authorization: Token ${HUB_TOKEN}" \
+          "${TASK_URL}")
+
+        TASK_STATE=$(echo "${TASK_RESPONSE}" | \
+          grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' | \
+          grep -o '"[^"]*"$' | tr -d '"' | head -1)
+
+        TASK_DETAIL=$(echo "${TASK_RESPONSE}" | \
+          grep -o '"error"[[:space:]]*:[[:space:]]*{[^}]*}' | head -1 || true)
+
+        POLL_COUNT=$(( POLL_COUNT + 1 ))
+        printf "[%3ds] poll #%-3d  state: %s\n" "${ELAPSED}" "${POLL_COUNT}" "${TASK_STATE}"
+
+        case "${TASK_STATE}" in
+          completed)
+            POLL_ELAPSED=$(( $(date +%s) - POLL_START ))
+            echo "Task completed successfully after ${POLL_ELAPSED}s"
+            break
+            ;;
+          failed|canceled)
+            echo "ERROR: Task ended with state '${TASK_STATE}'"
+            [ -n "${TASK_DETAIL}" ] && echo "Detail: ${TASK_DETAIL}"
+            exit 1
+            ;;
+        esac
+
+        sleep "${POLL_INTERVAL_SEC}"
+      done
+
+    # ── 3. Metrics summary ────────────────────────────────────────
+    - |
+      echo ""
+      echo "╔══════════════════════════════════════════════════╗"
+      echo "║            PUBLISH METRICS SUMMARY               ║"
+      echo "╠══════════════════════════════════════════════════╣"
+      printf "║  %-20s %-27s ║\n" "Collection:"     "${COLLECTION_NAMESPACE}.${COLLECTION_NAME}"
+      printf "║  %-20s %-27s ║\n" "Version:"        "${COLLECTION_VERSION}"
+      printf "║  %-20s %-27s ║\n" "Tarball size:"   "${TARBALL_SIZE}"
+      printf "║  %-20s %-27s ║\n" "Upload time:"    "${UPLOAD_ELAPSED}s"
+      printf "║  %-20s %-27s ║\n" "Import time:"    "${POLL_ELAPSED}s"
+      printf "║  %-20s %-27s ║\n" "Poll cycles:"    "${POLL_COUNT}"
+      printf "║  %-20s %-27s ║\n" "Total time:"     "$(( UPLOAD_ELAPSED + POLL_ELAPSED ))s"
+      printf "║  %-20s %-27s ║\n" "Hub repo:"       "${HUB_REPO}"
+      printf "║  %-20s %-27s ║\n" "Result:"         "SUCCESS ✓"
+      echo "╚══════════════════════════════════════════════════╝"
+
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS}" = "failed" ]; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════╗"
+        echo "║               PUBLISH FAILED ✗                   ║"
+        echo "╠══════════════════════════════════════════════════╣"
+        printf "║  %-20s %-27s ║\n" "Pipeline:"  "${CI_PIPELINE_URL}"
+        printf "║  %-20s %-27s ║\n" "Job:"       "${CI_JOB_URL}"
+        echo "╚══════════════════════════════════════════════════╝"
+      fi
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'

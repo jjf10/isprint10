@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# aap_performance_report_v2.yml
+#
+# v2 of the AAP performance report playbook.
+# Original v1 role and playbook are preserved unchanged.
+#
+# Usage:
+#   export AAP_URL=https://<controller-fqdn>
+#   export AAP_TOKEN=<oauth2-bearer-token>
+#   ansible-playbook aap_performance_report_v2.yml
+#
+# Common overrides:
+#   -e report_window_hours=48
+#   -e report_output_dir=/var/www/html/aap-reports
+#   -e report_auto_refresh_seconds=300    # live dashboard — refresh every 5 min
+#   -e alert_failure_rate_crit_pct=10
+#   -e alert_queue_depth_crit=20
+#   -e api_retry_count=5
+#
+# Fixes vs v1:
+#   - Token pre-flight validates the token before running 9+ API calls
+#   - All URL strings are single-line (v1 >- multi-line YAML bug added spaces)
+#   - Overflow booleans stored as bool, not string (string "False" is truthy)
+#   - Node degraded count uses correct Jinja2 parentheses
+#   - Null instance_group/inventory guard on all summary_fields accesses
+#   - sort(attribute='finished') pre-filters nulls to avoid crash
+#   - Capacity map handles null capacity fields
+#   - API call retries configurable via api_retry_count / api_retry_delay
+#
+# New in v2:
+#   - preflight.yml — GET /api/v2/ping/ + GET /api/v2/me/ token validation
+#   - gather_schedule_metrics.yml — upcoming schedules + overdue detection
+#   - Workflow job breakdown in the Failed Jobs section
+#   - Sortable table columns (vanilla JS)
+#   - Sticky navigation bar with section jump-links
+#   - @media print CSS for clean A4/letter printout
+#   - Auto-refresh <meta> (set report_auto_refresh_seconds > 0)
+#   - Controller version / HA / active-node in report header
+# =============================================================================
+
+- name: AAP Performance Report v2
+  hosts: localhost
+  connection: local
+  gather_facts: true       # required for ansible_date_time (report timestamps)
+
+  roles:
+    - role: aap_performance_report_v2
